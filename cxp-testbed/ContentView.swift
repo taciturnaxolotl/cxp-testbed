@@ -1,246 +1,366 @@
 import SwiftUI
 import AuthenticationServices
-import UniformTypeIdentifiers
+
+private enum ListFilter { case all, passkeys, done }
 
 struct ContentView: View {
-    @State private var showFilePicker = false
-    @State private var statusMessage = "Load a CXF JSON file to begin"
-    @State private var cxfData: CxfHeader?
+    @Environment(CredentialStore.self) private var store
+
+    @State private var selectedIDs: Set<Data> = []
+    @State private var exportedIDs: Set<Data> = []
+    @State private var filterText = ""
+    @State private var listFilter: ListFilter = .all
+    @State private var chunkSize = 10
     @State private var isExporting = false
+
+    // MARK: - Derived
+
+    private var flatItems: [FlatItem] {
+        guard let data = store.exportedData else { return [] }
+        return data.accounts.enumerated().flatMap { idx, account in
+            account.items.map { FlatItem(accountIndex: idx, item: $0) }
+        }
+    }
+
+    private var filteredItems: [FlatItem] {
+        flatItems.filter { flat in
+            let done = exportedIDs.contains(flat.item.id)
+            switch listFilter {
+            case .done:
+                return done
+            case .all:
+                guard !done else { return false }
+                return matchesSearch(flat)
+            case .passkeys:
+                guard !done else { return false }
+                guard flat.item.credentials.contains(where: { if case .passkey = $0 { true } else { false } }) else { return false }
+                return matchesSearch(flat)
+            }
+        }
+    }
+
+    private func matchesSearch(_ flat: FlatItem) -> Bool {
+        guard !filterText.isEmpty else { return true }
+        let q = filterText.lowercased()
+        if flat.item.title.lowercased().contains(q) { return true }
+        return flat.item.credentials.contains { cred in
+            if case .passkey(let pk) = cred {
+                return pk.relyingPartyIdentifier.lowercased().contains(q)
+                    || pk.userName.lowercased().contains(q)
+            }
+            return false
+        }
+    }
+
+    private var pendingCount: Int { flatItems.filter { !exportedIDs.contains($0.item.id) }.count }
+
+    // MARK: - Body
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
-                Image(systemName: "key.fill")
-                    .font(.system(size: 60))
-                    .foregroundStyle(.blue)
+            Group {
+                if store.exportedData == nil {
+                    emptyView
+                } else {
+                    listView
+                }
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("CXP Relay").font(.headline)
+                }
 
-                Text("CXP Passkey Exporter")
-                    .font(.title2.bold())
+                if store.exportedData != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Picker("Filter", selection: $listFilter) {
+                                Text("All").tag(ListFilter.all)
+                                Text("Passkeys only").tag(ListFilter.passkeys)
+                                Text("Done").tag(ListFilter.done)
+                            }
 
-                if let data = cxfData {
-                    VStack(spacing: 8) {
-                        Text("\(data.accounts.first?.items.count ?? 0) passkeys loaded")
-                            .font(.headline)
-                            .foregroundStyle(.green)
+                            if listFilter != .done {
+                                Divider()
+                                Button("Select All") {
+                                    selectedIDs = Set(filteredItems.map(\.item.id))
+                                }
+                                Button("Deselect All") {
+                                    selectedIDs = []
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                    }
 
-                        Text("From: \(data.exporterDisplayName)")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                    ToolbarItemGroup(placement: .bottomBar) {
+                        if listFilter != .done {
+                            Stepper(value: $chunkSize, in: 1...200, step: 5) {
+                                EmptyView()
+                            }
+                            .labelsHidden()
+
+                            Button("Next \(chunkSize)") {
+                                selectNextChunk()
+                            }
+
+                            Spacer()
+
+                            Button {
+                                exportSelected()
+                            } label: {
+                                Text("Export \(selectedIDs.count)")
+                                    .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(selectedIDs.isEmpty || isExporting)
+                        } else {
+                            Text("\(exportedIDs.count) exported")
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Clear") {
+                                exportedIDs = []
+                            }
+                            .foregroundStyle(.red)
+                        }
                     }
                 }
+            }
+        }
+        .onContinueUserActivity(ASCredentialExchangeActivity, perform: handleActivity)
+    }
 
-                Button {
-                    showFilePicker = true
-                } label: {
-                    Label("Load CXF JSON", systemImage: "doc.badge.plus")
-                        .frame(maxWidth: .infinity)
-                        .padding()
+    // MARK: - Empty state
+
+    private var emptyView: some View {
+        VStack(spacing: 0) {
+            Spacer()
+
+            VStack(spacing: 20) {
+                ZStack {
+                    Circle()
+                        .fill(.blue.opacity(0.12))
+                        .frame(width: 96, height: 96)
+                    Image(systemName: "arrow.left.arrow.right")
+                        .font(.system(size: 40, weight: .medium))
+                        .foregroundStyle(.blue)
                 }
-                .buttonStyle(.borderedProminent)
 
-                if cxfData != nil {
-                    Button {
-                        startExport()
-                    } label: {
-                        Label("Export to Another App", systemImage: "square.and.arrow.up")
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isExporting)
+                VStack(spacing: 8) {
+                    Text("CXP Relay")
+                        .font(.title2.bold())
+
+                    Text("Open another password manager, go to its export settings, and choose this app as the destination.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
                 }
+            }
 
-                Text(statusMessage)
+            Spacer()
+
+            if !store.statusMessage.isEmpty {
+                Text(store.statusMessage)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
-
-                Spacer()
-            }
-            .padding()
-            .navigationTitle("CXP Testbed")
-            .fileImporter(
-                isPresented: $showFilePicker,
-                allowedContentTypes: [.json],
-                allowsMultipleSelection: false
-            ) { result in
-                handleFileImport(result)
+                    .padding(.bottom, 24)
             }
         }
     }
 
-    private func handleFileImport(_ result: Result<[URL], Error>) {
-        switch result {
-        case .success(let urls):
-            guard let url = urls.first else { return }
+    // MARK: - List view
 
-            let accessing = url.startAccessingSecurityScopedResource()
-            defer {
-                if accessing { url.stopAccessingSecurityScopedResource() }
+    private var listView: some View {
+        List(filteredItems) { flat in
+            ItemRow(
+                item: flat.item,
+                isSelected: selectedIDs.contains(flat.item.id),
+                isDone: exportedIDs.contains(flat.item.id)
+            ) {
+                guard listFilter != .done else { return }
+                toggle(flat.item.id)
             }
+        }
+        .listStyle(.plain)
+        .searchable(text: $filterText, prompt: "Search by name or RP ID")
+    }
 
-            do {
-                let data = try Data(contentsOf: url)
-                let header = try JSONDecoder().decode(CxfHeader.self, from: data)
+    // MARK: - Actions
 
-                guard !header.accounts.isEmpty,
-                      !(header.accounts.first?.items.isEmpty ?? true) else {
-                    statusMessage = "Error: No items found in CXF file"
-                    return
-                }
-
-                cxfData = header
-                statusMessage = "Ready to export"
-            } catch {
-                statusMessage = "Error parsing CXF: \(error.localizedDescription)"
-            }
-
-        case .failure(let error):
-            statusMessage = "File error: \(error.localizedDescription)"
+    private func toggle(_ id: Data) {
+        if selectedIDs.contains(id) {
+            selectedIDs.remove(id)
+        } else {
+            selectedIDs.insert(id)
         }
     }
 
-    private func decodeBase64url(_ string: String) -> Data? {
-        var s = string
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        let pad = s.count % 4
-        if pad != 0 { s += String(repeating: "=", count: 4 - pad) }
-        return Data(base64Encoded: s)
+    private func selectNextChunk() {
+        // All pending items in display order
+        let pending = flatItems.filter { !exportedIDs.contains($0.item.id) }
+        // Find the position of the last currently-selected item
+        let lastSelectedIndex = pending.lastIndex { selectedIDs.contains($0.item.id) } ?? -1
+        // Select the N items that come after it (wraps to start if at end)
+        let startIndex = lastSelectedIndex + 1
+        let slice = pending.dropFirst(startIndex).prefix(chunkSize)
+        let next = slice.isEmpty ? Array(pending.prefix(chunkSize)) : Array(slice)
+        selectedIDs = Set(next.map(\.item.id))
     }
 
-    private func startExport() {
-        guard let cxfData else { return }
-        isExporting = true
-        statusMessage = "Preparing export..."
-
-        guard let windowScene = UIApplication.shared.connectedScenes
-            .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
-              let window = windowScene.keyWindow else {
-            statusMessage = "Error: Could not get presentation anchor"
-            isExporting = false
+    private func handleActivity(_ activity: NSUserActivity) {
+        let raw = activity.userInfo?[ASCredentialImportToken]
+        let token: UUID?
+        if let str = raw as? String {
+            token = UUID(uuidString: str)
+        } else if let uuid = raw as? UUID {
+            token = uuid
+        } else {
+            let keys = activity.userInfo?.keys.map { "\($0)" }.joined(separator: ", ") ?? "none"
+            store.statusMessage = "Bad token (\(type(of: raw))). Keys: \(keys)"
             return
         }
 
+        guard let token else {
+            store.statusMessage = "Malformed UUID in import token"
+            return
+        }
+
+        store.statusMessage = "Importing…"
         Task { @MainActor in
             do {
-                let exportManager = ASCredentialExportManager(presentationAnchor: window)
-                let options = try await exportManager.requestExport(for: nil)
-                let exportedData = try convertToExportedData(cxfData, formatVersion: options.formatVersion)
-                try await exportManager.exportCredentials(exportedData)
-
-                statusMessage = "Export complete!"
-                isExporting = false
+                let data = try await ASCredentialImportManager().importCredentials(token: token)
+                store.load(data)
+                selectedIDs = []
+                exportedIDs = []
             } catch {
-                let ns = error as NSError
-                statusMessage = "Export failed [\(ns.domain) \(ns.code)]: \(error.localizedDescription)"
-                isExporting = false
+                store.statusMessage = "Import failed: \(error.localizedDescription)"
             }
         }
     }
 
-    private func convertToExportedData(
-        _ header: CxfHeader,
-        formatVersion: ASExportedCredentialData.FormatVersion
-    ) throws -> ASExportedCredentialData {
-        var accounts: [ASImportableAccount] = []
+    private func exportSelected() {
+        guard let source = store.exportedData, !selectedIDs.isEmpty else { return }
+        isExporting = true
 
-        for account in header.accounts {
-            var items: [ASImportableItem] = []
-
-            for item in account.items {
-                var credentials: [ASImportableCredential] = []
-
-                for cred in item.credentials {
-                    switch cred {
-                    case .passkey(let pk):
-                        guard let keyData = decodeBase64url(pk.key),
-                              let credIdData = decodeBase64url(pk.credentialId),
-                              let userHandleData = decodeBase64url(pk.userHandle) else {
-                            continue
-                        }
-
-                        let passkey = ASImportableCredential.Passkey(
-                            credentialID: credIdData,
-                            relyingPartyIdentifier: pk.rpId,
-                            userName: pk.username,
-                            userDisplayName: pk.userDisplayName,
-                            userHandle: userHandleData,
-                            key: keyData
-                        )
-                        credentials.append(.passkey(passkey))
-
-                    case .basicAuth(let ba):
-                        let basicAuth = ASImportableCredential.BasicAuthentication(
-                            userName: ba.username.map {
-                                ASImportableEditableField(
-                                    id: nil,
-                                    fieldType: .string,
-                                    value: $0
-                                )
-                            },
-                            password: ba.password.map {
-                                ASImportableEditableField(
-                                    id: nil,
-                                    fieldType: .concealedString,
-                                    value: $0
-                                )
-                            }
-                        )
-                        credentials.append(.basicAuthentication(basicAuth))
-
-                    case .unknown:
-                        break
-                    }
+        Task { @MainActor in
+            do {
+                guard let scene = UIApplication.shared.connectedScenes
+                    .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
+                      let window = scene.keyWindow else {
+                    isExporting = false
+                    return
                 }
 
-                guard !credentials.isEmpty else { continue }
+                let manager = ASCredentialExportManager(presentationAnchor: window)
+                let options = try await manager.requestExport(for: nil)
+                let subset = buildSubset(from: source, formatVersion: options.formatVersion)
+                try await manager.exportCredentials(subset)
 
-                let itemId = item.id.data(using: .utf8) ?? Data()
-
-                let created = item.creationAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
-                let lastModified = item.modifiedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) } ?? created
-
-                let importableItem: ASImportableItem
-                if let created, let lastModified {
-                    importableItem = ASImportableItem(
-                        id: itemId,
-                        created: created,
-                        lastModified: lastModified,
-                        title: item.title,
-                        credentials: credentials
-                    )
-                } else {
-                    importableItem = ASImportableItem(
-                        id: itemId,
-                        title: item.title,
-                        credentials: credentials
-                    )
-                }
-                items.append(importableItem)
+                exportedIDs.formUnion(selectedIDs)
+                selectedIDs = []
+            } catch {
+                store.statusMessage = "Failed: \(error.localizedDescription)"
             }
+            isExporting = false
+        }
+    }
 
-            let accountId = account.id.data(using: .utf8) ?? Data()
-
-            let importableAccount = ASImportableAccount(
-                id: accountId,
-                userName: account.username,
+    private func buildSubset(
+        from data: ASExportedCredentialData,
+        formatVersion: ASExportedCredentialData.FormatVersion
+    ) -> ASExportedCredentialData {
+        let accounts = data.accounts.compactMap { account -> ASImportableAccount? in
+            let items = account.items
+                .filter { selectedIDs.contains($0.id) }
+                .map { item -> ASImportableItem in
+                    let hasPasskey = item.credentials.contains { if case .passkey = $0 { true } else { false } }
+                    guard hasPasskey else { return item }
+                    var stripped = item
+                    stripped.credentials = item.credentials.filter { if case .passkey = $0 { true } else { false } }
+                    return stripped
+                }
+            guard !items.isEmpty else { return nil }
+            return ASImportableAccount(
+                id: account.id,
+                userName: account.userName,
                 email: account.email,
-                fullName: nil,
-                collections: [],
+                fullName: account.fullName,
+                collections: account.collections,
                 items: items
             )
-            accounts.append(importableAccount)
         }
-
         return ASExportedCredentialData(
             accounts: accounts,
             formatVersion: formatVersion,
-            exporterRelyingPartyIdentifier: header.exporterRpId,
-            exporterDisplayName: header.exporterDisplayName,
-            timestamp: Date(timeIntervalSince1970: TimeInterval(header.timestamp))
+            exporterRelyingPartyIdentifier: data.exporterRelyingPartyIdentifier,
+            exporterDisplayName: data.exporterDisplayName,
+            timestamp: Date()
         )
+    }
+}
+
+// MARK: - Supporting types
+
+private struct FlatItem: Identifiable {
+    let accountIndex: Int
+    let item: ASImportableItem
+    var id: Data { item.id }
+}
+
+private struct ItemRow: View {
+    let item: ASImportableItem
+    let isSelected: Bool
+    let isDone: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 12) {
+                Image(systemName: isDone ? "checkmark.circle.fill" : isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(isDone ? .green : isSelected ? Color.accentColor : .secondary)
+                    .font(.title3)
+                    .animation(.easeInOut(duration: 0.12), value: isSelected)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title)
+                        .foregroundStyle(isDone ? .secondary : .primary)
+
+                    if let sub = rpID {
+                        Text(sub)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                Spacer()
+
+                HStack(spacing: 6) {
+                    ForEach(typeSymbols, id: \.self) { sym in
+                        Image(systemName: sym)
+                            .font(.caption)
+                            .foregroundStyle(.quaternary)
+                    }
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var rpID: String? {
+        for cred in item.credentials {
+            if case .passkey(let pk) = cred { return pk.relyingPartyIdentifier }
+        }
+        return nil
+    }
+
+    private var typeSymbols: [String] {
+        item.credentials.compactMap { cred in
+            if case .passkey = cred { return "key.fill" }
+            if case .basicAuthentication = cred { return "lock.fill" }
+            return nil
+        }
     }
 }
